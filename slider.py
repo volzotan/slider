@@ -14,7 +14,7 @@ import sys
 SERIAL_BAUDRATE         = 115200
 SERIAL_TIMEOUT_READ     = 0.5
 SERIAL_TIMEOUT_WRITE    = 0.5
-SERIAL_PORT_GRBL        = "/dev/tty.wchusbserial14210"
+SERIAL_PORT_GRBL        = ["/dev/tty.wchusbserial14210", "/dev/ttyUSB0"]
 SERIAL_PORT_TRIGGER     = "/dev/ttyAMA0"
 
 FILE_EXTENSION          = ".arw"
@@ -27,7 +27,7 @@ PRE_CAPTURE_WAIT        = 0.5
 POST_CAPTURE_WAIT       = 0.1
 
 MODE_INTERVAL           = "interval"
-MODE_CONT               = "continuous"
+MODE_VIDEO              = "video"
 
 def _send_command(ser, cmd, param=None):
     response = ""
@@ -118,22 +118,21 @@ if __name__ == "__main__":
     ap.add_argument(
         "command",
         default=MODE_INTERVAL,
-        choices=[MODE_INTERVAL, MODE_CONT], 
+        choices=[MODE_INTERVAL, MODE_VIDEO], 
         help=""
     )
 
     ap.add_argument("-x", type=int, help="X axis units [mm]")
     ap.add_argument("-y", type=int, help="Y axis units [mm]")
     ap.add_argument("-z", type=int, help="Z axis units [mm]")
+    ap.add_argument("-f", "--feedrate", type=int, default=FEEDRATE, help="movement speed [mm/min]")
     ap.add_argument("-s", "--shutter-count", type=int, help="shutter trigger count")
-    ap.add_argument("-t", "--time", type=int, help="total movement time from start to end [ms]")
-    ap.add_argument("-d", "--delay", type=int, default=1, help="delay [ms]")
+    ap.add_argument("-d", "--delay", type=int, default=1, help="delay [s]")
     ap.add_argument("-e", "--external-trigger", help="use an external USB trigger board")
     ap.add_argument("--debug", action="store_true", default=False, help="print debug messages")
     args = vars(ap.parse_args())
     
     input_shutter = args["shutter_count"]
-    input_duration = args["time"]
     input_delay = args["delay"]
 
     log.info("init")
@@ -157,10 +156,22 @@ if __name__ == "__main__":
     # global exception hook for killing the serial connection
     sys.excepthook = global_except_hook
 
-    ser_grbl = serial.Serial(
-        SERIAL_PORT_GRBL, SERIAL_BAUDRATE, 
-        timeout=SERIAL_TIMEOUT_READ, 
-        write_timeout=SERIAL_TIMEOUT_WRITE)
+    for port_name in SERIAL_PORT_GRBL:
+        try:
+            ser_grbl = serial.Serial(
+                port_name, SERIAL_BAUDRATE, 
+                timeout=SERIAL_TIMEOUT_READ, 
+                write_timeout=SERIAL_TIMEOUT_WRITE)
+
+            log.debug("opening port {} successful".format(port_name))
+            break
+        except Exception as e:
+            log.debug("opening port {} failed: {}".format(port_name, e))
+
+    if ser_grbl is None:
+        log.error("no grbl found on all ports. exit.")
+        sys.exit(-1)
+
     time.sleep(2.0)
     response = ser_grbl.read(100) # get rid of init message "Grbl 1.1h ['$' for help]"
 
@@ -193,7 +204,7 @@ if __name__ == "__main__":
 
     # modes
 
-    if args["command"] == MODE_INTERVAL: # INTERVAL MODE 
+    if args["command"] == MODE_INTERVAL: # INTERVAL/TIMELAPSE MODE 
 
         steps = []
         step_size = [0, 0, 0]
@@ -215,6 +226,10 @@ if __name__ == "__main__":
             log.info("INTERVAL: {}/{}: X: {:5.2f} Y:{:5.2f} Z:{:5.2f}".format(
                 i+1, input_shutter, *steps[i]))
 
+            # move
+            cmd = "G1 X{} Y{} Z{}".format(*steps[i])
+            _send_command(ser_grbl, cmd)
+
             while(True):
                 try:
                     resp = _send_command(ser_grbl, "G4 P0")
@@ -223,6 +238,8 @@ if __name__ == "__main__":
                 else:
                     log.debug("grbl command buffer done")
                     break
+
+            log.debug("TRIGGER [{}/{}]".format(i+1, input_shutter))
 
             # EXT SHUTTER:
 
@@ -240,34 +257,52 @@ if __name__ == "__main__":
             #     time.sleep(0.1)
             #     print("sleep")
 
-            # GPHOTO
+            # GPHOTO:
 
-            log.debug("TRIGGER [{}/{}]".format(i+1, input_shutter))
+            time.sleep(PRE_CAPTURE_WAIT)
 
-            # time.sleep(PRE_CAPTURE_WAIT)
+            temp_file = "capt0000{}".format(FILE_EXTENSION)
+            filename = _acquire_filename(GPHOTO_DIRECTORY)
 
-            # temp_file = "capt0000{}".format(FILE_EXTENSION)
-            # filename = _acquire_filename(GPHOTO_DIRECTORY)
+            if filename is None:
+                raise Exception("could not acquire filename")
 
-            # if filename is None:
-            #     raise Exception("could not acquire filename")
+            subprocess.call("gphoto2 --capture-image-and-download --force-overwrite", shell=True)
+            if not os.path.exists(temp_file):
+                raise Exception("captured RAW file missing")
+            shutil.move(temp_file, os.path.join(*filename))
 
-            # subprocess.call("gphoto2 --capture-image-and-download --force-overwrite", shell=True)
-            # if not os.path.exists(temp_file):
-            #     raise Exception("captured RAW file missing")
-            # shutil.move(temp_file, os.path.join(*filename))
+            log.info("FILE: {}".format(filename[1]))
 
-            # log.debug("camera save done: {}".format(filename[1]))
-
-            # time.sleep(POST_CAPTURE_WAIT)
-
-            # move
-            cmd = "G1 X{} Y{} Z{}".format(*steps[i])
-            _send_command(ser_grbl, cmd)
+            time.sleep(POST_CAPTURE_WAIT)
 
 
-    elif args["command"] == MODE_CONT: # TIME MODE
-        pass
+    elif args["command"] == MODE_VIDEO:
+
+        cmd = "G1 "
+
+        if not args["x"] is None:
+            cmd += "X{}".format(args["x"])
+
+        if not args["y"] is None:
+            cmd += "Y{}".format(args["y"])
+
+        if not args["z"] is None:
+            cmd += "Z{}".format(args["z"])
+
+        cmd += " F{}".format(args["feedrate"]) 
+        
+        _send_command(ser_grbl, cmd)
+
+        while(True):
+            try:
+                resp = _send_command(ser_grbl, "G4 P0")
+            except Exception as e:
+                pass
+            else:
+                log.debug("grbl command buffer done")
+                break
+
     else:
         pass
 
