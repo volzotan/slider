@@ -1,6 +1,5 @@
 #!/bin/python3
 
-import serial
 import logging
 import argparse
 from datetime import datetime
@@ -10,17 +9,22 @@ import subprocess
 import shutil
 import re
 import sys
+from fractions import Fraction
+
+import serial
+import picamera
 
 SERIAL_BAUDRATE         = 115200
 SERIAL_TIMEOUT_READ     = 0.5
 SERIAL_TIMEOUT_WRITE    = 0.5
-SERIAL_PORT_GRBL        = ["/dev/tty.wchusbserial14210", "/dev/ttyUSB0"]
+SERIAL_PORT_GRBL        = ["/dev/tty.wchusbserial14210", "/dev/ttyUSB0", "/dev/tty.usbserial-14420"]
 SERIAL_PORT_TRIGGER     = "/dev/ttyAMA0"
 
 FILE_EXTENSION          = ".arw"
-GPHOTO_DIRECTORY        = "/home/pi/storage"
+OUTPUT_DIRECTORY        = "/home/pi/storage"
 
 FEEDRATE                = 2000 
+FEEDRATE_SLOW           = 500
 
 # INTERVAL MODE
 PRE_CAPTURE_WAIT        = 0.5
@@ -28,6 +32,21 @@ POST_CAPTURE_WAIT       = 0.1
 
 MODE_INTERVAL           = "interval"
 MODE_VIDEO              = "video"
+MODE_BOUNCE             = "bounce"
+MODE_DISABLE            = "disable"
+
+# PICAMERA
+
+SENSOR_MODE             = 0
+EXPOSURE_COMPENSATION   = 0
+
+# OSX (microscope lens)
+
+FEEDRATE                = 1000 
+PRE_CAPTURE_WAIT        = 2.0
+FILE_EXTENSION          = ".jpg"
+# OUTPUT_DIRECTORY        = "/Users/volzotan/Downloads/slider_output"
+
 
 def _send_command(ser, cmd, param=None):
     response = ""
@@ -47,8 +66,8 @@ def _send_command(ser, cmd, param=None):
         response = ser.read(100)
         response = response.decode("utf-8") 
 
-        # remove every non-alphanumeric / non-underscore / non-space / non-decimalpoint character
-        response = re.sub("[^a-zA-Z0-9_ .]", '', response)
+        # remove every non-alphanumeric / non-underscore / non-space / non-decimalpoint / non-dollarsign character
+        response = re.sub("[^a-zA-Z0-9_ .$]", '', response)
 
         log.debug("serial receive: {}".format(response))
 
@@ -56,14 +75,20 @@ def _send_command(ser, cmd, param=None):
             log.debug("empty response".format())
             raise Exception("empty response or timeout")
 
-        if not response.startswith("ok"):
+        if cmd == "?":
+            return response
+
+        if response.startswith(cmd):
+            response = response[len(cmd):]
+
+        if response.startswith("ok"):        
+            if len(response) > 1:
+                return response[3:]
+            else: 
+                return None
+        else:
             log.debug("serial error, non ok response: {}".format(response))
             raise Exception("serial error, non ok response: {}".format(response))
-
-        if len(response) > 1:
-            return response[3:]
-        else: 
-            return None
 
     except serial.serialutil.SerialException as se:
         log.error("comm failed, SerialException: {}".format(se))
@@ -95,6 +120,19 @@ def global_except_hook(exctype, value, traceback):
     sys.__excepthook__(exctype, value, traceback)
 
 
+# wait till grbl finished it's moves and reports status IDLE instead of RUN or ERROR
+def wait_for_idle():
+    while(True):
+        try:
+            # example: <Idle|MPos:17.530,0.000,0.000|FS:0,0|WCO:0.000,0.000,0.000>
+            resp = _send_command(ser_grbl, "?")
+
+            if resp.startswith("Idle"):
+                break
+        except Exception as e:
+            log.debug("wait-for-idle loop failed: {}".format(e))
+ 
+
 def close_ports():
 
     log.info("closing serial connections")
@@ -105,6 +143,10 @@ def close_ports():
     if not ser_trigger is None:
         ser_trigger.close()
 
+    if not camera is None:
+        camera.stop_preview()
+        camera.close()
+
 
 log = logging.getLogger()
 
@@ -112,13 +154,14 @@ if __name__ == "__main__":
 
     global ser_grbl
     global ser_trigger
+    global camera
 
     ap = argparse.ArgumentParser()
 
     ap.add_argument(
         "command",
         default=MODE_INTERVAL,
-        choices=[MODE_INTERVAL, MODE_VIDEO], 
+        choices=[MODE_INTERVAL, MODE_VIDEO, MODE_BOUNCE, MODE_DISABLE], 
         help=""
     )
 
@@ -129,6 +172,7 @@ if __name__ == "__main__":
     ap.add_argument("-s", "--shutter-count", type=int, help="shutter trigger count")
     ap.add_argument("-d", "--delay", type=int, default=1, help="delay [s]")
     ap.add_argument("-e", "--external-trigger", help="use an external USB trigger board")
+    ap.add_argument("-p", "--picamera", action="store_true", default=False, help="use a raspberry pi camera module")
     ap.add_argument("--debug", action="store_true", default=False, help="print debug messages")
     args = vars(ap.parse_args())
     
@@ -156,6 +200,10 @@ if __name__ == "__main__":
     # global exception hook for killing the serial connection
     sys.excepthook = global_except_hook
 
+    camera = None
+    ser_grbl = None
+    ser_trigger = None
+
     for port_name in SERIAL_PORT_GRBL:
         try:
             ser_grbl = serial.Serial(
@@ -175,7 +223,13 @@ if __name__ == "__main__":
     time.sleep(2.0)
     response = ser_grbl.read(100) # get rid of init message "Grbl 1.1h ['$' for help]"
 
-    ser_trigger = None
+    if args["command"] == MODE_DISABLE:
+        log.info("disabling motors...")
+        resp = _send_command(ser_grbl, "$X")
+        log.info("grbl: {}".format(resp))
+        close_ports()
+        log.info("motors disabled. exit...")
+        sys.exit()
 
     if args["external_trigger"]:
         ser_trigger = serial.Serial(
@@ -183,11 +237,44 @@ if __name__ == "__main__":
             timeout=SERIAL_TIMEOUT_READ, 
             write_timeout=SERIAL_TIMEOUT_WRITE)
     else:
-        if os.uname().nodename == "raspberrypi":
+        if os.uname().nodename in ["raspberrypi", "slider"]:
             try:
-                os.makedir(GPHOTO_DIRECTORY)
+                os.mkdir(OUTPUT_DIRECTORY)
             except OSError as e:
-                log.debug("creating directory {} failed".format(GPHOTO_DIRECTORY))
+                log.debug("creating directory {} failed".format(OUTPUT_DIRECTORY))
+        else:
+            log.warn("platform is not raspberry pi ({}), not creating OUTPUT_DIRECTORY: {}".format(os.uname().nodename, OUTPUT_DIRECTORY))
+
+    if args["picamera"]:
+
+        if not FILE_EXTENSION == ".jpg":
+            log.warn("picamera mode enabled, overwriting FILE_EXTENSION to jpg")
+            FILE_EXTENSION = ".jpg"
+
+        camera = picamera.PiCamera(sensor_mode=SENSOR_MODE) 
+        camera.meter_mode = "average"
+        camera.exposure_compensation = EXPOSURE_COMPENSATION
+
+        resolutions = {}
+        resolutions["HQ"] = [[4056, 3040], Fraction(1, 2)]
+        resolutions["V2"] = [[3280, 2464], Fraction(1, 2)]
+        resolutions["V1"] = [[2592, 1944], Fraction(1, 2)]
+
+        for key in resolutions.keys():
+            try:
+                camera.resolution = resolutions[key][0]
+                # camera.framerate = resolutions[key][1]
+                camera_type = key
+                log.info("camera resolution set to [{}]: {}".format(key, resolutions[key][0]))
+                break
+            except picamera.exc.PiCameraValueError as e:
+                log.debug("failing setting camera resolution for {}, attempting fallback".format(key))
+
+        camera.start_preview()
+
+        time.sleep(5)
+
+        camera.exposure_mode = "off"
 
     # GRBL setup
 
@@ -209,6 +296,9 @@ if __name__ == "__main__":
         steps = []
         step_size = [0, 0, 0]
 
+        if input_shutter <= 1:
+            raise Exception("interval needs to be at least 2")
+
         if not args["x"] is None:
             step_size[0] = float(args["x"])/(input_shutter-1)
 
@@ -227,17 +317,10 @@ if __name__ == "__main__":
                 i+1, input_shutter, *steps[i]))
 
             # move
-            cmd = "G1 X{} Y{} Z{}".format(*steps[i])
+            cmd = "G1 X{} Y{} Z{} F{}".format(*steps[i], FEEDRATE_SLOW)
             _send_command(ser_grbl, cmd)
 
-            while(True):
-                try:
-                    resp = _send_command(ser_grbl, "G4 P0")
-                except Exception as e:
-                    pass
-                else:
-                    log.debug("grbl command buffer done")
-                    break
+            wait_for_idle()
 
             log.debug("TRIGGER [{}/{}]".format(i+1, input_shutter))
 
@@ -262,19 +345,34 @@ if __name__ == "__main__":
             time.sleep(PRE_CAPTURE_WAIT)
 
             temp_file = "capt0000{}".format(FILE_EXTENSION)
-            filename = _acquire_filename(GPHOTO_DIRECTORY)
+            filename = _acquire_filename(OUTPUT_DIRECTORY)
 
             if filename is None:
                 raise Exception("could not acquire filename")
 
-            subprocess.call("gphoto2 --capture-image-and-download --force-overwrite", shell=True)
-            if not os.path.exists(temp_file):
-                raise Exception("captured RAW file missing")
-            shutil.move(temp_file, os.path.join(*filename))
+            if args["picamera"]:
+                camera.capture(os.path.join(*filename))
+            else:
+                subprocess.call("gphoto2 --capture-image-and-download --force-overwrite", shell=True)
+            
+                if not os.path.exists(temp_file):
+                    raise Exception("captured image file missing")
+                shutil.move(temp_file, os.path.join(*filename))
 
             log.info("FILE: {}".format(filename[1]))
 
             time.sleep(POST_CAPTURE_WAIT)
+
+        # return to home
+
+        log.info("return home")
+
+        cmd = "G1 X{} Y{} Z{}".format(0, 0, 0)
+        _send_command(ser_grbl, cmd)
+
+        wait_for_idle()
+
+        log.info("DONE")
 
 
     elif args["command"] == MODE_VIDEO:
@@ -303,8 +401,40 @@ if __name__ == "__main__":
                 log.debug("grbl command buffer done")
                 break
 
+    elif args["command"] == MODE_BOUNCE:
+
+        move_cmd = "G1 "
+
+        if not args["x"] is None:
+            move_cmd += "X{}".format(args["x"])
+
+        if not args["y"] is None:
+            move_cmd += "Y{}".format(args["y"])
+
+        if not args["z"] is None:
+            move_cmd += "Z{}".format(args["z"])
+
+        move_cmd += " F{}".format(args["feedrate"]) 
+
+        cmds = [move_cmd, "G1 X0 Y0 Z0 F{}".format(args["feedrate"])]
+        
+        for cmd in cmds:
+
+            _send_command(ser_grbl, cmd)
+
+            while(True):
+                try:
+                    resp = _send_command(ser_grbl, "G4 P0")
+                except Exception as e:
+                    pass
+                else:
+                    log.debug("grbl command buffer done")
+                    break
+
+        log.info("DONE")
+
     else:
-        pass
+        raise Exception("unknown mode: {}".format(args["command"]))
 
     close_ports()
     log.info("done.")
