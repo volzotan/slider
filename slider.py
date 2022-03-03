@@ -33,6 +33,8 @@ POST_CAPTURE_WAIT       = 0.1
 MODE_INTERVAL           = "interval"
 MODE_VIDEO              = "video"
 MODE_BOUNCE             = "bounce"
+MODE_MACRO              = "macro"
+MODE_MOVE               = "move"
 MODE_DISABLE            = "disable"
 
 # PICAMERA
@@ -161,15 +163,16 @@ if __name__ == "__main__":
     ap.add_argument(
         "command",
         default=MODE_INTERVAL,
-        choices=[MODE_INTERVAL, MODE_VIDEO, MODE_BOUNCE, MODE_DISABLE], 
+        choices=[MODE_INTERVAL, MODE_VIDEO, MODE_BOUNCE, MODE_MOVE, MODE_MACRO, MODE_DISABLE], 
         help=""
     )
 
-    ap.add_argument("-x", type=int, help="X axis units [mm]")
-    ap.add_argument("-y", type=int, help="Y axis units [mm]")
-    ap.add_argument("-z", type=int, help="Z axis units [mm]")
+    ap.add_argument("-x", type=float, default=0, help="X axis units [mm]")
+    ap.add_argument("-y", type=float, default=0, help="Y axis units [mm]")
+    ap.add_argument("-z", type=float, default=0, help="Z axis units [mm]")
     ap.add_argument("-f", "--feedrate", type=int, default=FEEDRATE, help="movement speed [mm/min]")
     ap.add_argument("-s", "--shutter-count", type=int, help="shutter trigger count")
+    ap.add_argument("--stack-count", type=int, help="stack count for macro mode")
     ap.add_argument("-d", "--delay", type=int, default=1, help="delay [s]")
     ap.add_argument("-e", "--external-trigger", help="use an external USB trigger board")
     ap.add_argument("-p", "--picamera", action="store_true", default=False, help="use a raspberry pi camera module")
@@ -313,7 +316,7 @@ if __name__ == "__main__":
         
         for i in range(0, input_shutter):
 
-            log.info("INTERVAL: {}/{}: X: {:5.2f} Y:{:5.2f} Z:{:5.2f}".format(
+            log.info("INTERVAL {}/{} | X: {:5.2f} Y:{:5.2f} Z:{:5.2f}".format(
                 i+1, input_shutter, *steps[i]))
 
             # move
@@ -374,8 +377,107 @@ if __name__ == "__main__":
 
         log.info("DONE")
 
+    elif args["command"] == MODE_MACRO:
+
+        # do a focus stack on X, increment interval on Y/Z, focus stack on X, etc...
+
+        input_stack = args["stack_count"]
+
+        steps = []
+        step_size = [0, 0, 0]
+
+        if input_shutter is None or input_shutter < 1:
+            input_shutter = 1
+
+        if input_stack is None or input_stack <= 1:
+            raise Exception("stack-count needs to be at least 2")
+
+        if not args["x"] is None:
+            step_size[0] = float(args["x"])/(input_stack-1)
+
+        if not args["y"] is None and input_shutter > 1:
+            step_size[1] = float(args["y"])/(input_shutter-1)
+
+        if not args["z"] is None and input_shutter > 1:
+            step_size[2] = float(args["z"])/(input_shutter-1)
+
+        x_steps = []
+        for i in range(0, input_stack+1):
+            x_steps.append(step_size[0] * i)
+        for i in range(0, input_shutter+1):
+            steps.append([x_steps, step_size[1] * i, step_size[2] * i])
+
+        # log.info("MACRO {} | stack: {} X: {:5.2f} Y:{:5.2f} Z:{:5.2f}".format(int(input_shutter*input_stack), input_stack, *steps[i]))
+
+        for i in range(0, input_shutter):
+
+            stack_dir = "stack_{}".format(i)
+
+            if os.path.exists(OUTPUT_DIRECTORY):
+                try:
+                    os.mkdir(os.path.join(OUTPUT_DIRECTORY, stack_dir))
+                    log.debug("created stack dir: {}".format(stack_dir))
+                except Exception as e:
+                    log.error("creating stack dir {} failed".format(e))
+            else:
+                log.error("OUTPUT_DIRECTORY {} missing".format(OUTPUT_DIRECTORY))
+
+            for j in range(0, input_stack):
+
+                # move
+                cmd = "G1 X{} Y{} Z{} F{}".format(steps[i][0][j], steps[i][1], steps[i][2], FEEDRATE_SLOW)
+                _send_command(ser_grbl, cmd)
+
+                wait_for_idle()
+
+                log.debug("TRIGGER img in stack {}/{} | stack: {}/{} | total {}/{}".format(j+1, input_stack, i, input_shutter, i*input_stack + j+1, input_stack*input_shutter))
+
+                time.sleep(PRE_CAPTURE_WAIT)
+
+                filename = _acquire_filename(os.path.join(OUTPUT_DIRECTORY, stack_dir))
+
+                if filename is None:
+                    raise Exception("could not acquire filename")
+
+                if args["picamera"]:
+                    camera.capture(os.path.join(*filename))
+                else:
+                    log.error("gphoto not supported in macro mode yet")
+                    sys.exit(-1)
+
+                log.info("FILE: {}".format(filename[1]))
+
+                time.sleep(POST_CAPTURE_WAIT)
+
+            log.info("stack {} finished".format(i))
+
+        # return to home
+
+        log.info("return home")
+
+        cmd = "G1 X{} Y{} Z{}".format(0, 0, 0)
+        _send_command(ser_grbl, cmd)
+
+        wait_for_idle()
+
+        log.info("DONE")
+
+    elif args["command"] == MODE_MOVE:
+
+        pos = [float(args["x"]), float(args["y"]), float(args["z"])]
+        log.info("MOVE | X: {:5.2f} Y:{:5.2f} Z:{:5.2f}".format(*pos))
+
+        cmd = "G1 X{} Y{} Z{} F{}".format(*pos, FEEDRATE)
+        _send_command(ser_grbl, cmd)
+
+        wait_for_idle()
+
+        log.info("DONE")
 
     elif args["command"] == MODE_VIDEO:
+
+        pos = [float(args["x"]), float(args["y"]), float(args["z"])]
+        log.info("VIDEO | X: {:5.2f} Y:{:5.2f} Z:{:5.2f} F: {}".format(*pos, args["feedrate"]))
 
         cmd = "G1 "
 
@@ -392,16 +494,14 @@ if __name__ == "__main__":
         
         _send_command(ser_grbl, cmd)
 
-        while(True):
-            try:
-                resp = _send_command(ser_grbl, "G4 P0")
-            except Exception as e:
-                pass
-            else:
-                log.debug("grbl command buffer done")
-                break
+        wait_for_idle()
+
+        log.info("DONE")
 
     elif args["command"] == MODE_BOUNCE:
+
+        pos = [float(args["x"]), float(args["y"]), float(args["z"])]
+        log.info("BOUNCE | X: {:5.2f} Y:{:5.2f} Z:{:5.2f} F: {}".format(*pos, args["feedrate"]))
 
         move_cmd = "G1 "
 
@@ -419,17 +519,8 @@ if __name__ == "__main__":
         cmds = [move_cmd, "G1 X0 Y0 Z0 F{}".format(args["feedrate"])]
         
         for cmd in cmds:
-
             _send_command(ser_grbl, cmd)
-
-            while(True):
-                try:
-                    resp = _send_command(ser_grbl, "G4 P0")
-                except Exception as e:
-                    pass
-                else:
-                    log.debug("grbl command buffer done")
-                    break
+            wait_for_idle()
 
         log.info("DONE")
 
