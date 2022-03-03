@@ -35,6 +35,7 @@ MODE_VIDEO              = "video"
 MODE_BOUNCE             = "bounce"
 MODE_MACRO              = "macro"
 MODE_MOVE               = "move"
+MODE_WAIT               = "wait"
 MODE_DISABLE            = "disable"
 
 # PICAMERA
@@ -135,6 +136,35 @@ def wait_for_idle():
             log.debug("wait-for-idle loop failed: {}".format(e))
  
 
+def init_picamera():
+
+    global camera
+
+    camera = picamera.PiCamera(sensor_mode=SENSOR_MODE) 
+    camera.meter_mode = "average"
+    camera.exposure_compensation = EXPOSURE_COMPENSATION
+
+    resolutions = {}
+    resolutions["HQ"] = [[4056, 3040], Fraction(1, 2)]
+    resolutions["V2"] = [[3280, 2464], Fraction(1, 2)]
+    resolutions["V1"] = [[2592, 1944], Fraction(1, 2)]
+
+    for key in resolutions.keys():
+        try:
+            camera.resolution = resolutions[key][0]
+            # camera.framerate = resolutions[key][1]
+            camera_type = key
+            log.info("camera resolution set to [{}]: {}".format(key, resolutions[key][0]))
+            break
+        except picamera.exc.PiCameraValueError as e:
+            log.debug("failing setting camera resolution for {}, attempting fallback".format(key))
+
+    camera.start_preview()
+
+    time.sleep(3)
+
+    camera.exposure_mode = "off"
+
 def close_ports():
 
     log.info("closing serial connections")
@@ -163,7 +193,7 @@ if __name__ == "__main__":
     ap.add_argument(
         "command",
         default=MODE_INTERVAL,
-        choices=[MODE_INTERVAL, MODE_VIDEO, MODE_BOUNCE, MODE_MOVE, MODE_MACRO, MODE_DISABLE], 
+        choices=[MODE_INTERVAL, MODE_VIDEO, MODE_BOUNCE, MODE_MOVE, MODE_MACRO, MODE_WAIT, MODE_DISABLE], 
         help=""
     )
 
@@ -254,30 +284,7 @@ if __name__ == "__main__":
             log.warn("picamera mode enabled, overwriting FILE_EXTENSION to jpg")
             FILE_EXTENSION = ".jpg"
 
-        camera = picamera.PiCamera(sensor_mode=SENSOR_MODE) 
-        camera.meter_mode = "average"
-        camera.exposure_compensation = EXPOSURE_COMPENSATION
-
-        resolutions = {}
-        resolutions["HQ"] = [[4056, 3040], Fraction(1, 2)]
-        resolutions["V2"] = [[3280, 2464], Fraction(1, 2)]
-        resolutions["V1"] = [[2592, 1944], Fraction(1, 2)]
-
-        for key in resolutions.keys():
-            try:
-                camera.resolution = resolutions[key][0]
-                # camera.framerate = resolutions[key][1]
-                camera_type = key
-                log.info("camera resolution set to [{}]: {}".format(key, resolutions[key][0]))
-                break
-            except picamera.exc.PiCameraValueError as e:
-                log.debug("failing setting camera resolution for {}, attempting fallback".format(key))
-
-        camera.start_preview()
-
-        time.sleep(5)
-
-        camera.exposure_mode = "off"
+        init_picamera()
 
     # GRBL setup
 
@@ -430,7 +437,7 @@ if __name__ == "__main__":
 
                 wait_for_idle()
 
-                log.debug("TRIGGER img in stack {}/{} | stack: {}/{} | total {}/{}".format(j+1, input_stack, i, input_shutter, i*input_stack + j+1, input_stack*input_shutter))
+                log.info("TRIGGER img in stack {}/{} | stack: {}/{} | total {}/{}".format(j+1, input_stack, i, input_shutter, i*input_stack + j+1, input_stack*input_shutter))
 
                 time.sleep(PRE_CAPTURE_WAIT)
 
@@ -471,6 +478,16 @@ if __name__ == "__main__":
         _send_command(ser_grbl, cmd)
 
         wait_for_idle()
+
+        log.info("DONE")
+
+    elif args["command"] == MODE_WAIT:
+
+        log.info("WAIT")
+
+        time.sleep(10)
+
+        close_ports()
 
         log.info("DONE")
 
