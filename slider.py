@@ -27,8 +27,8 @@ FEEDRATE                = 2000
 FEEDRATE_SLOW           = 500
 
 # INTERVAL MODE
-PRE_CAPTURE_WAIT        = 0.5
-POST_CAPTURE_WAIT       = 0.1
+PRE_CAPTURE_WAIT        = 0.1
+POST_CAPTURE_WAIT       = 0.0
 
 MODE_INTERVAL           = "interval"
 MODE_VIDEO              = "video"
@@ -145,9 +145,13 @@ def init_picamera():
     camera.exposure_compensation = EXPOSURE_COMPENSATION
 
     resolutions = {}
+
     resolutions["HQ"] = [[4056, 3040], Fraction(1, 2)]
     resolutions["V2"] = [[3280, 2464], Fraction(1, 2)]
     resolutions["V1"] = [[2592, 1944], Fraction(1, 2)]
+
+    if args["lowres"]:
+        resolutions["HQ"] = [[1920, 1080], Fraction(1, 2)]
 
     for key in resolutions.keys():
         try:
@@ -200,12 +204,15 @@ if __name__ == "__main__":
     ap.add_argument("-x", type=float, default=0, help="X axis units [mm]")
     ap.add_argument("-y", type=float, default=0, help="Y axis units [mm]")
     ap.add_argument("-z", type=float, default=0, help="Z axis units [mm]")
+    ap.add_argument("-o", "--output-dir", default=OUTPUT_DIRECTORY, help="output directory path")
     ap.add_argument("-f", "--feedrate", type=int, default=FEEDRATE, help="movement speed [mm/min]")
     ap.add_argument("-s", "--shutter-count", type=int, help="shutter trigger count")
     ap.add_argument("--stack-count", type=int, help="stack count for macro mode")
     ap.add_argument("-d", "--delay", type=int, default=1, help="delay [s]")
+    ap.add_argument("--name", default=None, help="optional directory name")
     ap.add_argument("-e", "--external-trigger", help="use an external USB trigger board")
     ap.add_argument("-p", "--picamera", action="store_true", default=False, help="use a raspberry pi camera module")
+    ap.add_argument("--lowres", action="store_true", default=False, help="use a low resolution with the raspberry pi camera")
     ap.add_argument("--debug", action="store_true", default=False, help="print debug messages")
     args = vars(ap.parse_args())
     
@@ -271,12 +278,23 @@ if __name__ == "__main__":
             write_timeout=SERIAL_TIMEOUT_WRITE)
     else:
         if os.uname().nodename in ["raspberrypi", "slider"]:
+
+            # base dir
             try:
-                os.mkdir(OUTPUT_DIRECTORY)
+                os.mkdir(args["output_dir"])
             except OSError as e:
-                log.debug("creating directory {} failed".format(OUTPUT_DIRECTORY))
+                log.debug("creating directory {} failed".format(args["output_dir"]))
+
+            # capture specific dir
+            if args["name"] is not None:
+                try:
+                    os.mkdir(os.path.join(args["output_dir"], args["name"]))
+                except OSError as e:
+                    log.debug("creating directory {} failed".format(os.path.join(args["output_dir"], args["name"])))
+
         else:
-            log.warn("platform is not raspberry pi ({}), not creating OUTPUT_DIRECTORY: {}".format(os.uname().nodename, OUTPUT_DIRECTORY))
+            log.warn("platform is not raspberry pi ({}), not creating OUTPUT_DIRECTORY: {}".format(os.uname().nodename, args["output_dir"]))
+
 
     if args["picamera"]:
 
@@ -291,8 +309,8 @@ if __name__ == "__main__":
     grbl_setup_commands = [
         # "G91",                      # relative positioning
         "G90",                      # absolute positioning
-        "G10 P0 L20 X0 Y0 Z0",      # set current pos as zero
         "G21",                      # set units to millimeters
+        "G10 P0 L20 X0 Y0 Z0",      # set current pos as zero
         "G1 F{}".format(FEEDRATE)   # set feedrate to _ mm/min
     ]
 
@@ -355,7 +373,10 @@ if __name__ == "__main__":
             time.sleep(PRE_CAPTURE_WAIT)
 
             temp_file = "capt0000{}".format(FILE_EXTENSION)
-            filename = _acquire_filename(OUTPUT_DIRECTORY)
+            output_dir_path = args["output_dir"]
+            if args["name"] is not None:
+                output_dir_path = os.path.join(args["output_dir"], args["name"])
+            filename = _acquire_filename(output_dir_path)
 
             if filename is None:
                 raise Exception("could not acquire filename")
@@ -363,13 +384,13 @@ if __name__ == "__main__":
             if args["picamera"]:
                 camera.capture(os.path.join(*filename))
             else:
-                subprocess.call("gphoto2 --capture-image-and-download --force-overwrite", shell=True)
+                subprocess.run("gphoto2 --capture-image-and-download --force-overwrite", shell=True, check=True)
             
                 if not os.path.exists(temp_file):
                     raise Exception("captured image file missing")
                 shutil.move(temp_file, os.path.join(*filename))
 
-            log.info("FILE: {}".format(filename[1]))
+            log.debug("FILE: {}".format(filename[1]))
 
             time.sleep(POST_CAPTURE_WAIT)
 
@@ -420,14 +441,14 @@ if __name__ == "__main__":
 
             stack_dir = "stack_{}".format(i)
 
-            if os.path.exists(OUTPUT_DIRECTORY):
+            if os.path.exists(args["output_dir"]):
                 try:
-                    os.mkdir(os.path.join(OUTPUT_DIRECTORY, stack_dir))
+                    os.mkdir(os.path.join(args["output_dir"], stack_dir))
                     log.debug("created stack dir: {}".format(stack_dir))
                 except Exception as e:
                     log.error("creating stack dir {} failed".format(e))
             else:
-                log.error("OUTPUT_DIRECTORY {} missing".format(OUTPUT_DIRECTORY))
+                log.error("OUTPUT_DIRECTORY {} missing".format(args["output_dir"]))
 
             for j in range(0, input_stack):
 
@@ -441,7 +462,7 @@ if __name__ == "__main__":
 
                 time.sleep(PRE_CAPTURE_WAIT)
 
-                filename = _acquire_filename(os.path.join(OUTPUT_DIRECTORY, stack_dir))
+                filename = _acquire_filename(os.path.join(args["output_dir"], stack_dir))
 
                 if filename is None:
                     raise Exception("could not acquire filename")
