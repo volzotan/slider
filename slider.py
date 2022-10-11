@@ -281,16 +281,18 @@ if __name__ == "__main__":
 
             # base dir
             try:
-                os.mkdir(args["output_dir"])
+                if not os.path.exists(args["output_dir"]): 
+                    os.makedirs(args["output_dir"])
             except OSError as e:
-                log.debug("creating directory {} failed".format(args["output_dir"]))
+                log.error("creating directory {} failed".format(args["output_dir"]))
 
             # capture specific dir
             if args["name"] is not None:
                 try:
-                    os.mkdir(os.path.join(args["output_dir"], args["name"]))
+                    if not os.path.exists(os.path.join(args["output_dir"], args["name"])): 
+                        os.makedirs(os.path.join(args["output_dir"], args["name"]))
                 except OSError as e:
-                    log.debug("creating directory {} failed".format(os.path.join(args["output_dir"], args["name"])))
+                    log.error("creating directory {} failed".format(os.path.join(args["output_dir"], args["name"])))
 
         else:
             log.warn("platform is not raspberry pi ({}), not creating OUTPUT_DIRECTORY: {}".format(os.uname().nodename, args["output_dir"]))
@@ -473,7 +475,7 @@ if __name__ == "__main__":
                     log.error("gphoto not supported in macro mode yet")
                     sys.exit(-1)
 
-                log.info("FILE: {}".format(filename[1]))
+                log.debug("FILE: {}".format(filename[1]))
 
                 time.sleep(POST_CAPTURE_WAIT)
 
